@@ -4,13 +4,22 @@ from __future__ import unicode_literals
 from __future__ import print_function
 
 import os
+import torch as th
 from torch.utils.data import Dataset
 import numpy as np
 import pandas as pd
 from collections import defaultdict
 import json
 import random
+import pickle
 from dataloaders.rawvideo_util import RawVideoExtractor
+import time
+import lmdb
+import msgpack
+import msgpack_numpy as m
+m.patch()
+
+
 
 class MSRVTT_DataLoader(Dataset):
     """MSRVTT dataset loader."""
@@ -25,6 +34,7 @@ class MSRVTT_DataLoader(Dataset):
             image_resolution=224,
             frame_order=0,
             slice_framepos=0,
+            idx_aux='.'
     ):
         self.data = pd.read_csv(csv_path)
         self.features_path = features_path
@@ -38,7 +48,10 @@ class MSRVTT_DataLoader(Dataset):
         # 0: cut from head frames; 1: cut from tail frames; 2: extract frames uniformly.
         self.slice_framepos = slice_framepos
         assert self.slice_framepos in [0, 1, 2]
-
+        self.env = lmdb.open('msrvtt_data/lmdb/msrvtt.lmdb', subdir=os.path.isdir('msrvtt_data/lmdb/msrvtt.lmdb'),
+                    readonly=True, lock=False,
+                    readahead=False, meminit=False)
+ 
         self.rawVideoExtractor = RawVideoExtractor(framerate=feature_framerate, size=image_resolution)
         self.SPECIAL_TOKEN = {"CLS_TOKEN": "<|startoftext|>", "SEP_TOKEN": "<|endoftext|>",
                               "MASK_TOKEN": "[MASK]", "UNK_TOKEN": "[UNK]", "PAD_TOKEN": "[PAD]"}
@@ -95,8 +108,11 @@ class MSRVTT_DataLoader(Dataset):
             if os.path.exists(video_path) is False:
                 video_path = video_path.replace(".mp4", ".webm")
 
-            raw_video_data = self.rawVideoExtractor.get_video_data(video_path)
-            raw_video_data = raw_video_data['video']
+            #raw_video_data = self.rawVideoExtractor.get_video_data(video_path)
+            #raw_video_data = raw_video_data['video']
+            with self.env.begin(write=False) as txn:
+                raw_video_data = th.tensor(msgpack.loads(txn.get(video_id.encode())))
+
             if len(raw_video_data.shape) > 3:
                 raw_video_data_clip = raw_video_data
                 # L x T x 3 x H x W
@@ -131,10 +147,9 @@ class MSRVTT_DataLoader(Dataset):
     def __getitem__(self, idx):
         video_id = self.data['video_id'].values[idx]
         sentence = self.data['sentence'].values[idx]
-
         pairs_text, pairs_mask, pairs_segment, choice_video_ids = self._get_text(video_id, sentence)
         video, video_mask = self._get_rawvideo(choice_video_ids)
-        return pairs_text, pairs_mask, pairs_segment, video, video_mask
+        return pairs_text, pairs_mask, pairs_segment, video, video_mask, video_id, sentence
 
 class MSRVTT_TrainDataLoader(Dataset):
     """MSRVTT train dataset loader."""
@@ -165,7 +180,10 @@ class MSRVTT_TrainDataLoader(Dataset):
         # 0: cut from head frames; 1: cut from tail frames; 2: extract frames uniformly.
         self.slice_framepos = slice_framepos
         assert self.slice_framepos in [0, 1, 2]
-
+        self.env = lmdb.open('msrvtt_data/lmdb/msrvtt_all.lmdb', subdir=os.path.isdir('msrvtt_data/lmdb/msrvtt_all.lmdb'),
+                    readonly=True, lock=False,
+                    readahead=False, meminit=False)
+ 
         self.unfold_sentences = unfold_sentences
         self.sample_len = 0
         if self.unfold_sentences:
@@ -257,8 +275,11 @@ class MSRVTT_TrainDataLoader(Dataset):
             if os.path.exists(video_path) is False:
                 video_path = video_path.replace(".mp4", ".webm")
 
-            raw_video_data = self.rawVideoExtractor.get_video_data(video_path)
-            raw_video_data = raw_video_data['video']
+            #raw_video_data = self.rawVideoExtractor.get_video_data(video_path)
+            #raw_video_data = raw_video_data['video']
+            with self.env.begin(write=False) as txn:
+                raw_video_data = th.tensor(msgpack.loads(txn.get(video_id.encode())))
+
             if len(raw_video_data.shape) > 3:
                 raw_video_data_clip = raw_video_data
                 # L x T x 3 x H x W

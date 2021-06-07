@@ -1,2 +1,6 @@
 .git
 .idea
+__pycache__
+log*
+ckpt*
+msrvtt_data

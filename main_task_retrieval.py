@@ -8,6 +8,7 @@ from torch.utils.data import (SequentialSampler)
 import numpy as np
 import random
 import os
+import pickle
 from metrics import compute_metrics, tensor_text_to_video_metrics, tensor_video_to_text_sim
 import time
 import argparse
@@ -23,6 +24,8 @@ from dataloaders.dataloader_msvd_retrieval import MSVD_DataLoader
 from dataloaders.dataloader_lsmdc_retrieval import LSMDC_DataLoader
 torch.distributed.init_process_group(backend="nccl")
 
+import time
+
 global logger
 
 def get_args(description='CLIP4Clip on Retrieval Task'):
@@ -34,6 +37,7 @@ def get_args(description='CLIP4Clip on Retrieval Task'):
     parser.add_argument('--train_csv', type=str, default='data/.train.csv', help='')
     parser.add_argument('--val_csv', type=str, default='data/.val.csv', help='')
     parser.add_argument('--data_path', type=str, default='data/caption.pickle', help='data pickle file path')
+    parser.add_argument('--idx_aux', type=str, default='.', help='data pickle file path')
     parser.add_argument('--features_path', type=str, default='data/videos_feature.pickle', help='feature path')
 
     parser.add_argument('--num_thread_reader', type=int, default=1, help='')
@@ -139,6 +143,7 @@ def set_seed_logger(args):
     args.rank = rank
 
     if not os.path.exists(args.output_dir):
+        #print("--------------------------------", args.output_dir)
         os.makedirs(args.output_dir, exist_ok=True)
 
     logger = get_logger(os.path.join(args.output_dir, "log.txt"))
@@ -253,6 +258,7 @@ def dataloader_msrvtt_test(args, tokenizer):
         max_frames=args.max_frames,
         frame_order=args.eval_frame_order,
         slice_framepos=args.slice_framepos,
+        idx_aux=args.idx_aux,
     )
     dataloader_msrvtt = DataLoader(
         msrvtt_testset,
@@ -492,7 +498,16 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu):
         # ----------------------------
         # 1. cache the features
         # ----------------------------
-        for bid, batch in enumerate(test_dataloader):
+        start = time.time()
+        no_iters = 0
+
+        raw_captions = {}
+        vids = {}
+
+        for bid, batch_extended in enumerate(test_dataloader):
+            batch = batch_extended[:-2]
+            vid_ids = batch_extended[-2]
+            sentences = batch_extended[-1]
             batch = tuple(t.to(device) for t in batch)
             input_ids, input_mask, segment_ids, video, video_mask = batch
 
@@ -514,6 +529,14 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu):
                 total_video_num += b
             else:
                 sequence_output, visual_output = model.get_sequence_visual_output(input_ids, segment_ids, input_mask, video, video_mask)
+                for (kk, v_id) in enumerate(vid_ids):
+                    if v_id not in vids:
+                        vids[v_id] = visual_output[kk].cpu().detach().numpy()
+                        raw_captions[v_id] = []
+                    else:
+                        assert (vids[v_id] == visual_output[kk].cpu().detach().numpy()).all()
+                    raw_captions[v_id].append((sentences[kk], sequence_output[kk].cpu().detach().numpy()))
+
 
                 batch_sequence_output_list.append(sequence_output)
                 batch_list_t.append((input_mask, segment_ids,))
@@ -522,7 +545,9 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu):
                 batch_list_v.append((video_mask,))
 
             print("{}/{}\r".format(bid, len(test_dataloader)), end="")
-
+            stop = time.time()
+            no_iters += 1
+            print('Iter time:', (stop - start) / no_iters)
         # ----------------------------------
         # 2. calculate the similarity
         # ----------------------------------
@@ -562,9 +587,13 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu):
                 sim_matrix += parallel_outputs[idx]
             sim_matrix = np.concatenate(tuple(sim_matrix), axis=0)
         else:
-            sim_matrix = _run_on_single_gpu(model, batch_list_t, batch_list_v, batch_sequence_output_list, batch_visual_output_list)
+            sim_matrix = np.concatenate(tuple(_run_on_single_gpu(model, batch_list_t, batch_list_v, batch_sequence_output_list, batch_visual_output_list)), axis=0)
 
+        #pickle.dump(vids, open('./msrvtt_data/output_corect/vids' + args.idx_aux + '.pkl', 'wb'))
+        #pickle.dump(raw_captions, open('./msrvtt_data/output_corect/raw_captions' + args.idx_aux + '.pkl', 'wb'))
+        pickle.dump(sim_matrix, open('./msrvtt_data/jsfusion_sim_matrix.pkl', 'wb'))
     if multi_sentence_:
+        print(sim_matrix)
         logger.info("before reshape, sim matrix size: {} x {}".format(sim_matrix.shape[0], sim_matrix.shape[1]))
         cut_off_points2len_ = [itm + 1 for itm in cut_off_points_]
         max_length = max([e_-s_ for s_, e_ in zip([0]+cut_off_points2len_[:-1], cut_off_points2len_)])
@@ -610,6 +639,10 @@ def main():
     assert  args.task_type == "retrieval"
     model = init_model(args, device, n_gpu, args.local_rank)
 
+    model_parameters = filter(lambda p: p.requires_grad, model.parameters())
+    params = sum([np.prod(p.size()) for p in model_parameters])
+    print('!!!!!!!!!!!!!!!!!!!!!!', params)
+
     ## ####################################
     # freeze testing
     ## ####################################
@@ -648,6 +681,9 @@ def main():
         logger.info("  Num examples = %d", val_length)
 
     if args.do_train:
+        model_parameters = filter(lambda p: p.requires_grad, model.parameters())
+        params = sum([np.prod(p.size()) for p in model_parameters])
+        print('!!!!!!!!!!!!!!!!!!!!!!', params)
         train_dataloader, train_length, train_sampler = DATALOADER_DICT[args.datatype]["train"](args, tokenizer)
         num_train_optimization_steps = (int(len(train_dataloader) + args.gradient_accumulation_steps - 1)
                                         / args.gradient_accumulation_steps) * args.epochs
@@ -673,7 +709,7 @@ def main():
 
                 output_model_file = None
                 ## Uncomment if want to save checkpoint
-                # output_model_file = save_model(epoch, args, model, type_name="")
+                output_model_file = save_model(epoch, args, model, type_name="")
 
                 ## Run on val dataset, this process is *TIME-consuming*.
                 # logger.info("Eval on val dataset")

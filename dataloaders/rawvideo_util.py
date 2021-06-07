@@ -65,7 +65,6 @@ class RawVideoExtractorCV2():
                 images.append(preprocess(Image.fromarray(frame_rgb).convert("RGB")))
 
         cap.release()
-
         if len(images) > 0:
             video_data = th.tensor(np.stack(images))
         else:
